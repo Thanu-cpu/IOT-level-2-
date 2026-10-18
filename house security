@@ -1,0 +1,838 @@
+// ============================================================
+// ESP32-CAM + Blynk + PIR Security Camera
+// ============================================================
+
+#define BLYNK_TEMPLATE_ID   "TMPL3KdLVxPsG"
+#define BLYNK_TEMPLATE_NAME "House Security"
+#define BLYNK_AUTH_TOKEN    "UxDmhOf3tDrYxnxSdbg84DT-fti0BBSN"
+#define BLYNK_SERVER        "blr1.blynk.cloud"
+
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <BlynkSimpleEsp32.h>
+#include <esp_camera.h>
+#include <esp_http_server.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+
+// ============================================================
+// WIFI
+// ============================================================
+
+char ssid[] = "ARIHANT";
+char pass[] = "asdfghjkl";
+
+// ============================================================
+// IMGBB
+// ============================================================
+
+String imgbbApiKey = "f98152780646f8ae04181aa2d2f0eae9";
+
+// ============================================================
+// PINS
+// ============================================================
+
+#define PIR_PIN     2
+#define BUZZER_PIN  4
+
+// ============================================================
+// SETTINGS
+// ============================================================
+
+bool alarmEnabled = true;
+
+unsigned long lastTrigger = 0;
+const unsigned long COOLDOWN = 15000;
+
+BlynkTimer timer;
+
+// Camera/stream state
+bool cameraOK = false;
+httpd_handle_t streamServer = NULL;
+
+// ============================================================
+// CAMERA
+// AI-THINKER ESP32-CAM PIN CONFIGURATION
+// ============================================================
+
+void setupCamera() {
+
+  camera_config_t config;
+
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+
+  config.pin_d0 = 5;
+  config.pin_d1 = 18;
+  config.pin_d2 = 19;
+  config.pin_d3 = 21;
+  config.pin_d4 = 36;
+  config.pin_d5 = 39;
+  config.pin_d6 = 34;
+  config.pin_d7 = 35;
+
+  config.pin_xclk = 0;
+  config.pin_pclk = 22;
+  config.pin_vsync = 25;
+  config.pin_href = 23;
+
+  config.pin_sscb_sda = 26;
+  config.pin_sscb_scl = 27;
+
+  config.pin_pwdn = 32;
+  config.pin_reset = -1;
+
+  config.xclk_freq_hz = 20000000;
+
+  // JPEG is required
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  // Reduced from SVGA to VGA to save RAM
+  config.frame_size = FRAMESIZE_VGA;
+
+  // Higher number = more compression = smaller JPEG
+  config.jpeg_quality = 15;
+
+  // One framebuffer = less RAM usage
+  config.fb_count = 1;
+
+#if defined(CAMERA_FB_IN_PSRAM)
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+#endif
+
+  Serial.println();
+  Serial.println("Initializing camera...");
+
+  esp_err_t err = esp_camera_init(&config);
+
+  if (err != ESP_OK) {
+
+    Serial.printf(
+      "Camera initialization FAILED. Error: 0x%x\n",
+      err
+    );
+
+    cameraOK = false;
+    return;
+  }
+
+  cameraOK = true;
+
+  Serial.println("Camera initialization OK");
+
+  sensor_t *s = esp_camera_sensor_get();
+
+  if (s != NULL) {
+    s->set_framesize(s, FRAMESIZE_VGA);
+    s->set_quality(s, 15);
+  }
+
+  Serial.printf(
+    "Free heap after camera: %u bytes\n",
+    ESP.getFreeHeap()
+  );
+}
+
+// ============================================================
+// STREAM HANDLER
+// ============================================================
+
+static esp_err_t stream_handler(httpd_req_t *req) {
+
+  if (!cameraOK) {
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+
+  esp_err_t res = ESP_OK;
+
+  char part_buf[64];
+
+  res = httpd_resp_set_type(
+    req,
+    "multipart/x-mixed-replace; boundary=frame"
+  );
+
+  if (res != ESP_OK) {
+    return res;
+  }
+
+  while (true) {
+
+    camera_fb_t *fb = esp_camera_fb_get();
+
+    if (!fb) {
+
+      Serial.println("Stream: camera capture failed");
+
+      delay(100);
+
+      continue;
+    }
+
+    size_t hlen = snprintf(
+      part_buf,
+      sizeof(part_buf),
+      "--frame\r\n"
+      "Content-Type: image/jpeg\r\n"
+      "Content-Length: %u\r\n\r\n",
+      (unsigned int)fb->len
+    );
+
+    res = httpd_resp_send_chunk(
+      req,
+      part_buf,
+      hlen
+    );
+
+    if (res == ESP_OK) {
+
+      res = httpd_resp_send_chunk(
+        req,
+        (const char *)fb->buf,
+        fb->len
+      );
+    }
+
+    if (res == ESP_OK) {
+
+      res = httpd_resp_send_chunk(
+        req,
+        "\r\n",
+        2
+      );
+    }
+
+    esp_camera_fb_return(fb);
+
+    if (res != ESP_OK) {
+
+      Serial.println("Stream client disconnected");
+
+      break;
+    }
+
+    // Prevent the stream from consuming the CPU continuously
+    delay(30);
+  }
+
+  return res;
+}
+
+// ============================================================
+// START STREAM SERVER
+// ============================================================
+
+void startStreamServer() {
+
+  if (!cameraOK) {
+    Serial.println("Stream server NOT started - camera unavailable");
+    return;
+  }
+
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+
+  config.server_port = 81;
+
+  // Reduce stack usage
+  config.stack_size = 4096;
+
+  Serial.println("Starting stream server...");
+
+  esp_err_t err = httpd_start(
+    &streamServer,
+    &config
+  );
+
+  if (err != ESP_OK) {
+
+    Serial.printf(
+      "Stream server failed: 0x%x\n",
+      err
+    );
+
+    return;
+  }
+
+  httpd_uri_t stream_uri;
+
+  stream_uri.uri = "/stream";
+  stream_uri.method = HTTP_GET;
+  stream_uri.handler = stream_handler;
+  stream_uri.user_ctx = NULL;
+
+  err = httpd_register_uri_handler(
+    streamServer,
+    &stream_uri
+  );
+
+  if (err != ESP_OK) {
+
+    Serial.printf(
+      "Stream URI registration failed: 0x%x\n",
+      err
+    );
+
+    return;
+  }
+
+  Serial.println("Stream server started");
+  Serial.println("Use:");
+  Serial.println("http://ESP32_IP_ADDRESS:81/stream");
+}
+
+// ============================================================
+// UPLOAD IMAGE TO IMGBB
+// ============================================================
+
+String uploadToImgbb(camera_fb_t *fb) {
+
+  if (fb == NULL) {
+    Serial.println("uploadToImgbb: NULL framebuffer");
+    return "";
+  }
+
+  if (fb->len == 0) {
+    Serial.println("uploadToImgbb: Empty image");
+    return "";
+  }
+
+  Serial.printf(
+    "JPEG size: %u bytes\n",
+    (unsigned int)fb->len
+  );
+
+  Serial.printf(
+    "Free heap before upload: %u bytes\n",
+    ESP.getFreeHeap()
+  );
+
+  WiFiClientSecure client;
+
+  // For testing. Production should use certificate validation.
+  client.setInsecure();
+
+  HTTPClient http;
+
+  String url =
+    "https://api.imgbb.com/1/upload?key=" +
+    imgbbApiKey;
+
+  if (!http.begin(client, url)) {
+
+    Serial.println("HTTP begin failed");
+
+    return "";
+  }
+
+  http.setTimeout(30000);
+
+  String boundary = "----ESP32CamBoundary";
+
+  String head =
+    "--" + boundary + "\r\n"
+    "Content-Disposition: form-data; "
+    "name=\"image\"; filename=\"intruder.jpg\"\r\n"
+    "Content-Type: image/jpeg\r\n\r\n";
+
+  String tail =
+    "\r\n--" + boundary + "--\r\n";
+
+  size_t totalLen =
+    head.length() +
+    fb->len +
+    tail.length();
+
+  Serial.printf(
+    "Upload payload size: %u bytes\n",
+    (unsigned int)totalLen
+  );
+
+  Serial.printf(
+    "Free heap before payload allocation: %u bytes\n",
+    ESP.getFreeHeap()
+  );
+
+  // IMPORTANT:
+  // We need one contiguous multipart buffer for HTTPClient.
+  uint8_t *payload =
+    (uint8_t *)malloc(totalLen);
+
+  if (payload == NULL) {
+
+    Serial.println(
+      "ERROR: Could not allocate upload buffer!"
+    );
+
+    Serial.printf(
+      "Free heap: %u bytes\n",
+      ESP.getFreeHeap()
+    );
+
+    http.end();
+
+    return "";
+  }
+
+  // Build multipart request
+  memcpy(
+    payload,
+    head.c_str(),
+    head.length()
+  );
+
+  memcpy(
+    payload + head.length(),
+    fb->buf,
+    fb->len
+  );
+
+  memcpy(
+    payload + head.length() + fb->len,
+    tail.c_str(),
+    tail.length()
+  );
+
+  http.addHeader(
+    "Content-Type",
+    "multipart/form-data; boundary=" + boundary
+  );
+
+  Serial.println("Uploading image to ImgBB...");
+
+  int httpCode =
+    http.POST(payload, totalLen);
+
+  // Free immediately
+  free(payload);
+
+  payload = NULL;
+
+  Serial.printf(
+    "ImgBB HTTP code: %d\n",
+    httpCode
+  );
+
+  String imageUrl = "";
+
+  if (httpCode == HTTP_CODE_OK) {
+
+    String response = http.getString();
+
+    Serial.println("ImgBB response:");
+
+    Serial.println(
+      response.substring(0, 500)
+    );
+
+    // ImgBB normally returns display_url
+    int idx =
+      response.indexOf("\"display_url\":\"");
+
+    if (idx != -1) {
+
+      int start =
+        idx + strlen("\"display_url\":\"");
+
+      int end =
+        response.indexOf("\"", start);
+
+      if (end > start) {
+
+        imageUrl =
+          response.substring(start, end);
+
+        imageUrl.replace("\\/", "/");
+
+        Serial.println(
+          "Image URL:"
+        );
+
+        Serial.println(imageUrl);
+      }
+    }
+
+    if (imageUrl.length() == 0) {
+
+      Serial.println(
+        "Could not extract display_url"
+      );
+    }
+
+  } else {
+
+    Serial.printf(
+      "ImgBB upload failed. HTTP code: %d\n",
+      httpCode
+    );
+
+    if (httpCode > 0) {
+
+      String response =
+        http.getString();
+
+      Serial.println(
+        response.substring(0, 500)
+      );
+    }
+  }
+
+  http.end();
+
+  Serial.printf(
+    "Free heap after upload: %u bytes\n",
+    ESP.getFreeHeap()
+  );
+
+  return imageUrl;
+}
+
+// ============================================================
+// CAPTURE PHOTO
+// ============================================================
+
+void capturePhoto() {
+
+  if (!cameraOK) {
+
+    Serial.println(
+      "Cannot capture: camera not initialized"
+    );
+
+    return;
+  }
+
+  Serial.println();
+  Serial.println("========== CAPTURE PHOTO ==========");
+
+  Serial.printf(
+    "Free heap before capture: %u\n",
+    ESP.getFreeHeap()
+  );
+
+  camera_fb_t *fb =
+    esp_camera_fb_get();
+
+  if (fb == NULL) {
+
+    Serial.println(
+      "ERROR: Camera capture failed"
+    );
+
+    return;
+  }
+
+  Serial.printf(
+    "Photo captured: %u bytes\n",
+    (unsigned int)fb->len
+  );
+
+  Serial.printf(
+    "Free heap after capture: %u\n",
+    ESP.getFreeHeap()
+  );
+
+  String imageUrl =
+    uploadToImgbb(fb);
+
+  // VERY IMPORTANT:
+  // Return framebuffer after upload is finished.
+  esp_camera_fb_return(fb);
+
+  fb = NULL;
+
+  Serial.printf(
+    "Free heap after returning framebuffer: %u\n",
+    ESP.getFreeHeap()
+  );
+
+  if (imageUrl.length() > 0) {
+
+    Serial.println(
+      "Image uploaded successfully"
+    );
+
+    // Send URL to Blynk
+    Blynk.virtualWrite(
+      V2,
+      imageUrl
+    );
+
+    Serial.println(
+      "Image URL sent to Blynk V2"
+    );
+
+  } else {
+
+    Serial.println(
+      "Image upload failed"
+    );
+  }
+
+  Serial.println(
+    "=================================="
+  );
+}
+
+// ============================================================
+// BLYNK V1
+// ARM / DISARM
+// ============================================================
+
+BLYNK_WRITE(V1) {
+
+  alarmEnabled =
+    param.asInt();
+
+  // Always turn buzzer off when state changes
+  digitalWrite(
+    BUZZER_PIN,
+    LOW
+  );
+
+  Serial.printf(
+    "Alarm %s\n",
+    alarmEnabled ? "ARMED" : "DISARMED"
+  );
+}
+
+// ============================================================
+// CHECK PIR
+// ============================================================
+
+void checkPIR() {
+
+  int motion =
+    digitalRead(PIR_PIN);
+
+  // Send PIR state to Blynk
+  Blynk.virtualWrite(
+    V0,
+    motion
+  );
+
+  if (
+    motion == HIGH &&
+    alarmEnabled &&
+    (millis() - lastTrigger > COOLDOWN)
+  ) {
+
+    lastTrigger =
+      millis();
+
+    Serial.println();
+    Serial.println(
+      "!!!!!!!!!!!!!!!!!!!!!!!!"
+    );
+
+    Serial.println(
+      "INTRUSION DETECTED!"
+    );
+
+    Serial.println(
+      "!!!!!!!!!!!!!!!!!!!!!!!!"
+    );
+
+    // Turn buzzer on
+    digitalWrite(
+      BUZZER_PIN,
+      HIGH
+    );
+
+    // Capture/upload photo
+    capturePhoto();
+
+    // Send Blynk event
+    Blynk.logEvent(
+      "intruder_alert",
+      "Motion detected! Check intruder image."
+    );
+
+  }
+
+  else if (motion == LOW) {
+
+    digitalWrite(
+      BUZZER_PIN,
+      LOW
+    );
+  }
+}
+
+// ============================================================
+// WIFI STATUS
+// ============================================================
+
+void printNetworkInfo() {
+
+  Serial.println();
+  Serial.println("========== NETWORK ==========");
+
+  Serial.print("WiFi SSID: ");
+  Serial.println(WiFi.SSID());
+
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  Serial.print("RSSI: ");
+  Serial.print(WiFi.RSSI());
+  Serial.println(" dBm");
+
+  Serial.print("Free heap: ");
+  Serial.println(ESP.getFreeHeap());
+
+  Serial.println("=============================");
+}
+
+// ============================================================
+// PERIODIC MEMORY DEBUG
+// ============================================================
+
+void printMemory() {
+
+  Serial.printf(
+    "Free heap: %u | Minimum heap: %u\n",
+    ESP.getFreeHeap(),
+    ESP.getMinFreeHeap()
+  );
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  delay(1000);
+
+  Serial.println();
+  Serial.println();
+  Serial.println(
+    "================================"
+  );
+
+  Serial.println(
+    "   ESP32-CAM SECURITY SYSTEM"
+  );
+
+  Serial.println(
+    "================================"
+  );
+
+  Serial.printf(
+    "Initial free heap: %u\n",
+    ESP.getFreeHeap()
+  );
+
+  // ----------------------------------------------------------
+  // GPIO
+  // ----------------------------------------------------------
+
+  pinMode(
+    PIR_PIN,
+    INPUT
+  );
+
+  pinMode(
+    BUZZER_PIN,
+    OUTPUT
+  );
+
+  digitalWrite(
+    BUZZER_PIN,
+    LOW
+  );
+
+  // ----------------------------------------------------------
+  // CAMERA
+  // ----------------------------------------------------------
+
+  setupCamera();
+
+  if (!cameraOK) {
+
+    Serial.println();
+    Serial.println(
+      "CAMERA FAILED."
+    );
+
+    Serial.println(
+      "Check ESP32-CAM board/pin configuration."
+    );
+
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // WIFI + BLYNK
+  // ----------------------------------------------------------
+
+  Serial.println();
+  Serial.println(
+    "Connecting to Blynk..."
+  );
+
+  Blynk.begin(
+    BLYNK_AUTH_TOKEN,
+    ssid,
+    pass,
+    BLYNK_SERVER,
+    80
+  );
+
+  Serial.println(
+    "Blynk connected."
+  );
+
+  printNetworkInfo();
+
+  // ----------------------------------------------------------
+  // STREAM SERVER
+  // ----------------------------------------------------------
+
+  startStreamServer();
+
+  // ----------------------------------------------------------
+  // PIR TIMER
+  // ----------------------------------------------------------
+
+  timer.setInterval(
+    200L,
+    checkPIR
+  );
+
+  // Memory monitor
+  timer.setInterval(
+    10000L,
+    printMemory
+  );
+
+  Serial.println();
+  Serial.println(
+    "System ARMED."
+  );
+
+  Serial.println(
+    "Waiting for motion..."
+  );
+
+  Serial.printf(
+    "Final free heap: %u\n",
+    ESP.getFreeHeap()
+  );
+}
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop() {
+
+  Blynk.run();
+
+  timer.run();
+
+  delay(1);
+}
