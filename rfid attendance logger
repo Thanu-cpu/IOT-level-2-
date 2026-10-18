@@ -1,0 +1,86 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <SPI.h>
+#include <MFRC522.h>
+
+#define SS_PIN 5
+#define RST_PIN 22
+
+MFRC522 rfid(SS_PIN, RST_PIN);
+
+const char* ssid = "Thanu";
+const char* password = "thanu@uvce";
+
+const char* serverURL = "https://script.google.com/macros/s/AKfycbzDrQ3yWl9yyvDglnE0iXsML8_Fxookv5cLAmUTtNPYtAHZw27ZzNZeTzAKy8pC2HLe/exec";
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  SPI.begin(18, 19, 23, SS_PIN);
+  rfid.PCD_Init();
+
+  WiFi.begin(ssid, password);
+
+  Serial.print("Connecting to hotspot");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi connected!");
+  Serial.println("Scan your RFID card.");
+}
+
+void loop() {
+  if (!rfid.PICC_IsNewCardPresent()) {
+    return;
+  }
+
+  if (!rfid.PICC_ReadCardSerial()) {
+    return;
+  }
+
+  String cardID = "";
+
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    if (rfid.uid.uidByte[i] < 0x10) {
+      cardID += "0";
+    }
+
+    cardID += String(rfid.uid.uidByte[i], HEX);
+  }
+
+  cardID.toUpperCase();
+
+  Serial.print("Card UID: ");
+  Serial.println(cardID);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+
+    String url = String(serverURL) + "?cardID=" + cardID;
+
+    http.begin(url);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
+    int httpCode = http.GET();
+
+    Serial.print("HTTP Response: ");
+    Serial.println(httpCode);
+
+    if (httpCode > 0) {
+      Serial.println(http.getString());
+    }
+
+    http.end();
+  } else {
+    Serial.println("WiFi disconnected!");
+  }
+
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+
+  delay(2000);
+}
