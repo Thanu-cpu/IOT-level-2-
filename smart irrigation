@@ -1,0 +1,26 @@
+const int sensorPin = A0;
+const int relayPin = 8;
+const int threshold = 500;
+
+void setup() {
+  pinMode(relayPin, OUTPUT);
+  digitalWrite(relayPin, HIGH);   // Relay OFF initially
+  Serial.begin(9600);
+}
+
+void loop() {
+  int moisture = analogRead(sensorPin);
+
+  Serial.print("Moisture Value: ");
+  Serial.println(moisture);
+
+  if (moisture > threshold) {
+    digitalWrite(relayPin, LOW);   // Relay ON → Solenoid valve opens
+    Serial.println("Soil Dry - Valve ON");
+  } else {
+    digitalWrite(relayPin, HIGH);  // Relay OFF → Solenoid valve closes
+    Serial.println("Soil Wet - Valve OFF");
+  }
+
+  delay(1000);
+}
