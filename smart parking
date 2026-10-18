@@ -1,0 +1,63 @@
+#define BLYNK_TEMPLATE_ID "TMPL3TshcbLYB"
+#define BLYNK_TEMPLATE_NAME "smart parking"
+#define BLYNK_AUTH_TOKEN "QAikIUrLpPm_--VAbpZpS6nMzsbN0oBi"
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+
+char ssid[] = "Thanuuuu";
+char pass[] = "thanu@uvce";
+
+#define TRIG_PIN 5
+#define ECHO_PIN 18
+
+BlynkTimer timer;
+
+void checkParking()
+{
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+
+  float distance = duration * 0.0343 / 2;
+
+  Serial.print("Distance: ");
+  Serial.print(distance);
+  Serial.println(" cm");
+
+  if (distance > 0 && distance < 10)
+  {
+    // CAR DETECTED → RED
+    Blynk.virtualWrite(V1, 0);
+    Blynk.virtualWrite(V2, 1);
+  }
+  else
+  {
+    // NO CAR → GREEN
+    Blynk.virtualWrite(V1, 1);
+    Blynk.virtualWrite(V2, 0);
+  }
+}
+
+void setup()
+{
+  Serial.begin(115200);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+
+  timer.setInterval(1000L, checkParking);
+}
+
+void loop()
+{
+  Blynk.run();
+  timer.run();
+}
