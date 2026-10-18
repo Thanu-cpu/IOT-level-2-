@@ -1,0 +1,76 @@
+import speech_recognition as sr
+import serial
+import time
+
+# CHANGE COM3 to your ESP32's actual COM port
+esp32 = serial.Serial("COM4", 115200, timeout=1)
+
+time.sleep(2)
+
+recognizer = sr.Recognizer()
+
+print("AI Home Assistant Started!")
+print("Say one of these commands:")
+print("Open")
+print("Close")
+print("Turn on")
+print("Turn off")
+print("Press Ctrl+C to stop.")
+
+try:
+    with sr.Microphone() as source:
+        print("Adjusting microphone...")
+        recognizer.adjust_for_ambient_noise(source, duration=2)
+
+        while True:
+            try:
+                print("\nListening...")
+                audio = recognizer.listen(
+                    source,
+                    timeout=10,
+                    phrase_time_limit=10
+                )
+
+                command = recognizer.recognize_google(audio)
+                command = command.lower()
+
+                print("You said:", command)
+
+                if "open" in command:
+                    esp32.write(b"OPEN\n")
+                    print("Opening door")
+
+                elif "close" in command:
+                    esp32.write(b"CLOSE\n")
+                    print("Closing door")
+
+                elif "turn on" in command:
+                    esp32.write(b"LED_ON\n")
+                    print("LED ON")
+
+                elif "turn off" in command:
+                    esp32.write(b"LED_OFF\n")
+                    print("LED OFF")
+
+                else:
+                    print("Command not recognised.")
+
+            except sr.WaitTimeoutError:
+                print("No speech detected. Try again.")
+
+            except sr.UnknownValueError:
+                print("Sorry, I couldn't understand. Try again.")
+
+            except sr.RequestError as e:
+                print("Speech recognition network error:", e)
+
+except KeyboardInterrupt:
+    print("\nVoice assistant stopped.")
+
+except Exception as e:
+    print("Error:", e)
+
+finally:
+    if esp32.is_open:
+        esp32.close()
+
