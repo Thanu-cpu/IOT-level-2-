@@ -1,0 +1,91 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+const char* ssid = "Thanu";
+const char* password = "thanu@uvce";
+
+// Replace with your computer's actual IPv4 address
+const char* server = "http://10.84.117.176:1880/streetdata";
+
+const int LDR_PIN = 34;
+const int PIR_PIN = 27;
+const int RELAY_PIN = 26;
+
+// Most relay modules of this type are active LOW.
+// If your relay behaves in reverse, change this to false.
+const bool RELAY_ACTIVE_LOW = true;
+
+// Temporary threshold; calibrate using Serial Monitor.
+const int DARK_THRESHOLD = 2000;
+
+void setRelay(bool on) {
+  if (RELAY_ACTIVE_LOW) {
+    digitalWrite(RELAY_PIN, on ? LOW : HIGH);
+  } else {
+    digitalWrite(RELAY_PIN, on ? HIGH : LOW);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(LDR_PIN, INPUT);
+  pinMode(PIR_PIN, INPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+
+  setRelay(false);
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to Wi-Fi");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWi-Fi connected!");
+  Serial.print("ESP32 IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+void loop() {
+  int lightValue = analogRead(LDR_PIN);
+  int motion = digitalRead(PIR_PIN);
+
+  // LDR to 3.3V and 22k resistor to GND:
+  // readings should generally be higher in brighter light.
+  bool dark = lightValue < DARK_THRESHOLD;
+  bool lightOn = dark && (motion == HIGH);
+
+  setRelay(lightOn);
+
+  String state;
+  if (!dark) {
+    state = "OFF - DAYLIGHT";
+  } else if (motion == HIGH) {
+    state = "ON - MOTION";
+  } else {
+    state = "OFF - DARK / IDLE";
+  }
+
+  Serial.printf("LDR: %d | PIR: %d | Light: %s\n",
+                lightValue, motion, state.c_str());
+
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.setTimeout(2000);
+    http.begin(server);
+    http.addHeader("Content-Type", "application/json");
+
+    String data = "{\"ldr\":" + String(lightValue) +
+                  ",\"pir\":" + String(motion) +
+                  ",\"light\":\"" + state + "\"}";
+
+    int response = http.POST(data);
+    Serial.printf("Node-RED HTTP response: %d\n", response);
+
+    http.end();
+  }
+
+  delay(2000);
+}
